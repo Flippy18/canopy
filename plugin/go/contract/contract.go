@@ -117,6 +117,11 @@ func (c *Contract) DeliverTx(request *PluginDeliverRequest) *PluginDeliverRespon
 	}
 }
 
+  // Mint tokens to recipient
+  recipient.Amount = msg.Amount
+  // Matshal updated state
+  recipientBytes , err = Marshal(recipient)
+}
 // EndBlock() is code that is executed at the end of 'applying' a block
 func (c *Contract) EndBlock(_ *PluginEndRequest) *PluginEndResponse {
 	return &PluginEndResponse{}
