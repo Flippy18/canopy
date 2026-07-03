@@ -101,11 +101,11 @@ func (c *Controller) CheckMempool() {
 	if c.Config.LazyMempoolCheckFrequencyS == 0 {
 		return
 	}
+	checkTimer := time.Duration(c.Config.LazyMempoolCheckFrequencyS) * time.Second
 	for {
-		// skip mempool checks while syncing: the mempool is unused (no proposals) and on nested
-		// chains the remote RPC calls (GetDexBatch) hold the mempool lock, blocking the sync loop
+		// skip mempool checks while syncing
 		if c.isSyncing.Load() {
-			time.Sleep(time.Duration(c.Config.LazyMempoolCheckFrequencyS) * time.Second)
+			time.Sleep(checkTimer)
 			continue
 		}
 		// keep a list of transaction needing to be gossipped
@@ -157,7 +157,7 @@ func (c *Controller) CheckMempool() {
 			}
 		}
 		// sleep until the next periodic check
-		time.Sleep(time.Duration(c.Config.LazyMempoolCheckFrequencyS) * time.Second)
+		time.Sleep(checkTimer)
 	}
 }
 
