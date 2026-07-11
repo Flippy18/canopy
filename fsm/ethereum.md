@@ -382,6 +382,7 @@ Pending visibility is node-local, just like Ethereum mempool visibility is node-
 
 *Purpose in RPC compatibility:*
 - `eth_getTransactionCount` is expected by many Ethereum tools and wallets to return a usable nonce.
+- The method should be treated as a next-usable compatibility nonce, not as a canonical count of how many transactions an address has historically sent.
 - The implementation is intended to be wallet-compatible for active Ethereum-derived accounts without introducing a full persistent Ethereum nonce subsystem into Canopy.
 - Canopy tolerates nonce gaps for Ethereum-submitted transactions; the values only need to remain distinct within the local pending set for a given block-building window.
 
@@ -389,6 +390,7 @@ Pending visibility is node-local, just like Ethereum mempool visibility is node-
 
 - Explicit historical block-number queries are **not** canonical Ethereum account-history semantics. If a caller asks for `eth_getTransactionCount(address, "0x...")`, the RPC validates the tag but serves a compatibility value instead of reconstructing the exact historical nonce for that address at that block.
 - Pending nonce visibility is local to the node's mempool and pending cache.
+- In load-balanced deployments, nonce-sensitive tooling should prefer sticky routing or querying the same node that accepted the pending transaction.
 - Cross-node false positives are reduced, not eliminated. They can still appear when the epoch rolls over, or when another node has seen pending transactions that the current node has not.
 - The method should be treated as compatibility-oriented rather than a full Ethereum archival nonce implementation.
 
