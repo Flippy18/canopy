@@ -42,11 +42,19 @@ export const useSearch = (searchTerm: string) => {
     // Detect if search term is a transaction hash
     const isHashSearch = searchTerm && searchTerm.length >= 32 && /^[a-fA-F0-9]+$/.test(searchTerm)
 
-    // Only use this hook for exact hashes
-    const { data: hashSearchData } = useTxByHash(isHashSearch ? searchTerm : '')
+    // Warm the tx-by-hash cache for exact hashes.
+    useTxByHash(isHashSearch ? searchTerm : '')
 
     // Get all validators for partial address search
     const { data: allValidatorsData } = useAllValidators()
+
+    // Ref so searchInData reads fresh validators without being an effect dep
+    // (which re-ran the search on every refetch/focus and flickered in Brave).
+    const allValidatorsRef = useRef(allValidatorsData)
+    allValidatorsRef.current = allValidatorsData
+
+    // Term currently shown; avoids blanking results when a re-run finds nothing.
+    const committedTermRef = useRef<string | null>(null)
 
     const searchInData = async (rawTerm: string) => {
         const term = rawTerm.trim()
@@ -54,6 +62,7 @@ export const useSearch = (searchTerm: string) => {
         if (!term) {
             // Invalidate any in-flight request and reset to the empty state.
             requestIdRef.current++
+            committedTermRef.current = null
             setResults(null)
             setIsSearching(false)
             setError(null)
@@ -87,7 +96,12 @@ export const useSearch = (searchTerm: string) => {
                     searchResults.addresses.length +
                     searchResults.validators.length +
                     searchResults.orders.length
-                if (!force && total === 0) return
+                if (total === 0) {
+                    if (!force) return
+                    // Don't blank results already shown for this same term.
+                    if (committedTermRef.current === term) return
+                }
+                committedTermRef.current = term
                 setResults({
                     total,
                     blocks: [...searchResults.blocks],
@@ -258,8 +272,9 @@ export const useSearch = (searchTerm: string) => {
                     // Search in validators list if available (validators take priority)
                     const foundValidatorAddresses = new Set<string>()
 
-                    if (allValidatorsData?.results) {
-                        const matchingValidators = allValidatorsData.results.filter((v: any) => {
+                    const validatorsList = allValidatorsRef.current
+                    if (validatorsList?.results) {
+                        const matchingValidators = validatorsList.results.filter((v: any) => {
                             const address = (v.address || '').toLowerCase()
                             return address.startsWith(termLower)
                         })
@@ -437,13 +452,16 @@ export const useSearch = (searchTerm: string) => {
         }
     }
 
+    // Re-run only on term change (not on background refetch/focus, which
+    // flickered in Brave). Validators are read via a ref instead.
     useEffect(() => {
         const timeoutId = setTimeout(() => {
             searchInData(searchTerm)
         }, 300) // 300ms debounce
 
         return () => clearTimeout(timeoutId)
-    }, [searchTerm, hashSearchData, isHashSearch, allValidatorsData])
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [searchTerm])
 
     return {
         results,
