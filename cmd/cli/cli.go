@@ -55,9 +55,9 @@ var versionCmd = &cobra.Command{
 }
 
 var (
-	client, config, l          = &rpc.Client{}, lib.Config{}, lib.LoggerI(nil)
-	DataDir, validatorKey      = "", crypto.PrivateKeyI(nil)
-	rpcURLFlag, adminURLFlag   string
+	client, config, l        = &rpc.Client{}, lib.Config{}, lib.LoggerI(nil)
+	DataDir, validatorKey    = "", crypto.PrivateKeyI(nil)
+	rpcURLFlag, adminURLFlag string
 )
 
 func init() {
@@ -144,7 +144,10 @@ func waitForKill() {
 
 func getFirstPassword(log lib.LoggerI) string {
 	// allow flag config to skip initial password
-	if pwd == "" {
+	if pwd != "" {
+		return pwd
+	}
+	for {
 		// get the password from the user
 		log.Infof("Enter password for your new private key:")
 		password, e := term.ReadPassword(int(os.Stdin.Fd()))
@@ -153,12 +156,10 @@ func getFirstPassword(log lib.LoggerI) string {
 		}
 		if password == nil {
 			log.Infof("Password cannot be empty")
-			return getFirstPassword(log)
+			continue
 		}
 		return string(password)
 	}
-
-	return pwd
 }
 
 // InitializeDataDirectory() populates the data directory with configuration and data files if missing
