@@ -335,8 +335,12 @@ func (s *StateMachine) HandleDexBatchOrders(remoteBatch *lib.DexBatch, x, y *uin
 	if *x == 0 || *y == 0 {
 		return nil, ErrInvalidLiquidityPool()
 	}
-	// for each order
-	for _, order := range sorted {
+	// for each order (pseudorandomly ordered above so the settlement cap selects fairly)
+	for i, order := range sorted {
+		// per-block settlement cap: remaining orders keep a zero receipt and get refunded on the origin chain
+		if i >= lib.MaxOrdersSettledPerBlock {
+			break
+		}
 		// set up 'deltaX'
 		dX := order.AmountForSale
 		// 'deltaY' = (dX * y) / (x + dX)
@@ -347,13 +351,22 @@ func (s *StateMachine) HandleDexBatchOrders(remoteBatch *lib.DexBatch, x, y *uin
 		}
 		// capture result in map to save receipts later
 		result[order.Key] = dY
+		// update dx with overflow protection
+		var xAfter uint64
+		if dY != 0 {
+			var overflow bool
+			xAfter, overflow = lib.AddUint64(*x, dX)
+			if overflow {
+				return nil, ErrInvalidLiquidityPool()
+			}
+		}
 		// emit swap event
 		if err = s.EventDexSwap(order.Address, order.OrderId, dX, dY, chainId, false, dY != 0); err != nil {
 			return
 		}
 		// if succeeded: update pool ledgers like uniswap would
 		if dY != 0 {
-			*x, *y = *x+dX, *y-dY
+			*x, *y = xAfter, *y-dY
 		}
 	}
 	// set success in the receipt
@@ -397,13 +410,22 @@ func (s *StateMachine) HandleBatchWithdraw(batch *lib.DexBatch, counterChainId u
 	}
 	// collect withdrawals
 	for _, w := range batch.Withdrawals {
+		if w == nil {
+			s.log.Warnf("an error occurred retrieving the pool points for: %x, nil withdrawal", []byte{})
+			continue // defensive
+		}
 		initialPoints, e := p.GetPointsFor(w.Address)
 		if e != nil {
 			s.log.Errorf("an error occurred retrieving the pool points for: %x, %s", w.Address, e.Error())
 			continue // defensive
 		}
 		// update the total points to remove
-		totalPointsToRemove += lib.SafeMulDiv(initialPoints, w.Percent, 100)
+		pointsToRemove := lib.SafeMulDiv(initialPoints, w.Percent, 100)
+		var overflow bool
+		totalPointsToRemove, overflow = lib.AddUint64(totalPointsToRemove, pointsToRemove)
+		if overflow {
+			return ErrInvalidLiquidityPool()
+		}
 	}
 	if totalPointsToRemove == 0 || p.TotalPoolPoints == 0 {
 		return nil
@@ -420,6 +442,10 @@ func (s *StateMachine) HandleBatchWithdraw(batch *lib.DexBatch, counterChainId u
 	var paidY, paidX uint64
 	// distribute tokens
 	for _, w := range batch.Withdrawals {
+		if w == nil {
+			s.log.Warnf("an error occurred retrieving the pool points for: %x, nil withdrawal", []byte{})
+			continue // defensive
+		}
 		initialPoints, e := p.GetPointsFor(w.Address)
 		if e != nil {
 			s.log.Warnf("an error occurred retrieving the pool points for: %x, %s", w.Address, e.Error())
@@ -474,18 +500,70 @@ func (s *StateMachine) HandleBatchDeposit(batch *lib.DexBatch, chainId uint64, x
 	if err != nil {
 		return err
 	}
-	// define variables
-	var totalDeposit, distributed uint64
 	// x = the initial 'deposit' pool balance
 	// y = the 'counter' pool balance
 	// L = initial pool points
 	L := p.TotalPoolPoints
-	// sum all deposits
+	// sum all deposits for the invariant guard below
+	var rawTotalDeposit uint64
 	for _, deposit := range batch.Deposits {
-		totalDeposit += deposit.Amount
+		var overflow bool
+		rawTotalDeposit, overflow = lib.AddUint64(rawTotalDeposit, deposit.Amount)
+		if overflow {
+			return ErrInvalidLiquidityPool()
+		}
 	}
 	// nothing to add or failed invariant check
-	if totalDeposit == 0 || *x == 0 || *y == 0 {
+	if rawTotalDeposit == 0 || *x == 0 || *y == 0 {
+		return nil
+	}
+	// PASS 1: enforce the LP holder cap per-deposit. Remote batches skip the enqueue-time cap check, so
+	// an at-cap deposit from a brand-new LP is refunded/failed individually here instead of erroring the
+	// whole batch (which would brick the chain: the batch is re-served every block and can never rotate).
+	accepted := make([]bool, len(batch.Deposits))
+	seenNewHolders := make(map[string]struct{})
+	projectedHolders := len(p.Points)
+	var totalDeposit uint64
+	for i, deposit := range batch.Deposits {
+		// a zero-amount deposit can't create a holder, so it never counts against the cap
+		isNewHolder := false
+		if deposit.Amount > 0 {
+			if _, e := p.GetPointsFor(deposit.Address); e != nil && e.Code() == lib.CodePointHolderNotFound {
+				if _, seen := seenNewHolders[string(deposit.Address)]; !seen {
+					isNewHolder = true
+				}
+			}
+		}
+		// new LP at capacity: refund (local side) and skip its points
+		if isNewHolder && projectedHolders >= lib.MaxLiquidityProviders {
+			if local {
+				// return the escrowed funds to the depositor
+				if err = s.PoolSub(chainId+HoldingPoolAddend, deposit.Amount); err != nil {
+					return err
+				}
+				if err = s.AccountAdd(crypto.NewAddress(deposit.Address), deposit.Amount); err != nil {
+					return err
+				}
+			}
+			// emit a failed (zero-share) deposit event
+			if err = s.EventDexLiquidityDeposit(deposit.Address, deposit.OrderId, deposit.Amount, 0, chainId, local); err != nil {
+				return err
+			}
+			continue
+		}
+		if isNewHolder {
+			seenNewHolders[string(deposit.Address)] = struct{}{}
+			projectedHolders++
+		}
+		accepted[i] = true
+		var overflow bool
+		totalDeposit, overflow = lib.AddUint64(totalDeposit, deposit.Amount)
+		if overflow {
+			return ErrInvalidLiquidityPool()
+		}
+	}
+	// all deposits refunded/skipped - pool object untouched, nothing to persist
+	if totalDeposit == 0 {
 		return nil
 	}
 	// if no liq points yet assigned - initialize to 'dead' address
@@ -493,7 +571,9 @@ func (s *StateMachine) HandleBatchDeposit(batch *lib.DexBatch, chainId uint64, x
 		// calculate the initial pool points using L = √( x * y )
 		L = lib.SqrtProductUint64(*x, *y)
 		// add points to the dead address
-		p.AddPoints(deadAddr.Bytes(), L)
+		if err = p.AddPoints(deadAddr.Bytes(), L); err != nil {
+			return err
+		}
 	}
 	// using integer math and geometric mean of reserves:
 	// deltaPoolPoints = L * ( √((x + totalDeposit) * y) - √(x * y) ) / √(x * y) or simplified as:
@@ -502,33 +582,55 @@ func (s *StateMachine) HandleBatchDeposit(batch *lib.DexBatch, chainId uint64, x
 	if oldK == 0 {
 		return ErrInvalidLiquidityPool()
 	}
-	newK := lib.SqrtProductUint64(*x+totalDeposit, *y)
-	// totalDL is calculated as if all deposits is just 1 big deposit
+	// only accepted deposits enter the reserves
+	xAfterTotalDeposit, overflow := lib.AddUint64(*x, totalDeposit)
+	if overflow {
+		return ErrInvalidLiquidityPool()
+	}
+	newK := lib.SqrtProductUint64(xAfterTotalDeposit, *y)
+	if newK < oldK {
+		return ErrInvalidLiquidityPool()
+	}
+	// totalDL is calculated as if all accepted deposits are just 1 big deposit
 	totalDL := lib.SafeMulDiv(L, newK-oldK, oldK)
-	// distribute the points
-	for _, deposit := range batch.Deposits {
+	// PASS 2: distribute points for the accepted deposits
+	var distributed uint64
+	for i, deposit := range batch.Deposits {
+		if !accepted[i] {
+			continue
+		}
 		// calculate pro-rate share for this particular deposit
 		share := lib.SafeMulDiv(totalDL, deposit.Amount, totalDeposit)
 		// update the distributed counter
 		distributed += share
 		// add points to pool
-		p.AddPoints(deposit.Address, share)
+		if err = p.AddPoints(deposit.Address, share); err != nil {
+			return err
+		}
 		// if 'local' request - (actually move from holding pool to liquidity pool, don't *just* update the ledger)
 		if local {
 			if err = s.PoolSub(chainId+HoldingPoolAddend, deposit.Amount); err != nil {
 				return err
 			}
-			p.Amount += deposit.Amount
+			p.Amount, overflow = lib.AddUint64(p.Amount, deposit.Amount)
+			if overflow {
+				return ErrInvalidLiquidityPool()
+			}
 		}
 		// update the reserve
-		*x += deposit.Amount
+		*x, overflow = lib.AddUint64(*x, deposit.Amount)
+		if overflow {
+			return ErrInvalidLiquidityPool()
+		}
 		// emit a deposit event
 		if err = s.EventDexLiquidityDeposit(deposit.Address, deposit.OrderId, deposit.Amount, share, chainId, local); err != nil {
 			return err
 		}
 	}
 	// sink dust to the dead account
-	p.AddPoints(deadAddr.Bytes(), totalDL-distributed)
+	if err = p.AddPoints(deadAddr.Bytes(), totalDL-distributed); err != nil {
+		return err
+	}
 	// update the pool
 	return s.SetPool(p)
 }
